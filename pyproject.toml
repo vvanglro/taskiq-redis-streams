@@ -1,0 +1,60 @@
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[project]
+name = "taskiq-redis-streams"
+version = "0.1.0"
+description = "A Redis Streams broker for Taskiq."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "vvanglro", email = "vvanglro@gmail.com" }]
+keywords = ["async", "redis", "redis-streams", "taskiq", "tasks"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+  "redis>=5,<9",
+  "taskiq>=0.12,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/vvanglro/taskiq-redis-streams"
+Repository = "https://github.com/vvanglro/taskiq-redis-streams"
+Issues = "https://github.com/vvanglro/taskiq-redis-streams/issues"
+
+[dependency-groups]
+dev = [
+  "mypy>=1.15",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+  "ruff>=0.9",
+]
+
+[tool.uv.build-backend]
+module-root = "src"
+module-name = "taskiq_redis_streams"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+src = ["src", "tests"]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+pretty = true
+files = ["src", "tests"]
