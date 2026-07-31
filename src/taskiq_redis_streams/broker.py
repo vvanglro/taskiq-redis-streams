@@ -40,9 +40,6 @@ class RedisStreamsBroker(AsyncBroker):
         *,
         queue_name: str = "taskiq",
         namespace: str = "taskiq",
-        consumer_group_name: str | None = None,
-        consumer_name: str | None = None,
-        consumer_id: str = "0",
         xread_block: int = 2_000,
         xread_count: int = 100,
         max_pending: int | None = 100,
@@ -61,13 +58,6 @@ class RedisStreamsBroker(AsyncBroker):
         :param url: Redis connection URL.
         :param queue_name: Taskiq queue represented by this broker.
         :param namespace: Prefix used for the stream and default group keys.
-        :param consumer_group_name: Redis consumer group name. By default it is
-            derived from ``namespace`` and ``queue_name``.
-        :param consumer_name: Redis consumer name. A unique name is generated
-            when omitted.
-        :param consumer_id: Stream offset used when creating the group. ``0``
-            consumes entries published before worker startup; ``$`` only reads
-            future entries.
         :param xread_block: Maximum XREADGROUP block time in milliseconds.
         :param xread_count: Maximum number of entries fetched per XREADGROUP.
         :param max_pending: Maximum entries delivered to this listener but not
@@ -114,12 +104,11 @@ class RedisStreamsBroker(AsyncBroker):
         self.queue_name = queue_name
         self.namespace = namespace
         self.stream_name = stream_key(queue_name, namespace)
-        self.consumer_group_name = consumer_group_name or consumer_group_key(
+        self.consumer_group_name = consumer_group_key(
             queue_name,
             namespace,
         )
-        self.consumer_name = consumer_name or f"worker-{uuid.uuid4().hex}"
-        self.consumer_id = consumer_id
+        self.consumer_name = f"worker-{uuid.uuid4().hex}"
         self.xread_block = xread_block
         self.xread_count = xread_count
         self.max_pending = max_pending
@@ -139,7 +128,7 @@ class RedisStreamsBroker(AsyncBroker):
                 await redis.xgroup_create(
                     self.stream_name,
                     self.consumer_group_name,
-                    id=self.consumer_id,
+                    id="0",
                     mkstream=True,
                 )
             except ResponseError as exc:

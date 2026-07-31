@@ -68,6 +68,15 @@ def as_text(value: bytes | str | int) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
+def test_broker_generates_unique_consumer_names() -> None:
+    """Each broker instance owns a fresh Redis consumer identity."""
+    first = RedisStreamsBroker("redis://127.0.0.1:7000/14")
+    second = RedisStreamsBroker("redis://127.0.0.1:7000/14")
+
+    assert first.consumer_name.startswith("worker-")
+    assert first.consumer_name != second.consumer_name
+
+
 @pytest.mark.asyncio
 async def test_namespaced_stream_round_trip_and_ack(redis_url: str) -> None:
     """The broker stores and acknowledges an entry in its namespaced Stream."""
@@ -80,6 +89,7 @@ async def test_namespaced_stream_round_trip_and_ack(redis_url: str) -> None:
 
     assert received.data == b"payload"
     assert broker.stream_name.endswith(":stream:jobs")
+    assert broker.consumer_group_name.endswith(":workers:jobs")
     await acknowledge(received)
 
     redis = Redis.from_url(redis_url)

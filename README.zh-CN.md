@@ -36,8 +36,8 @@ async def process_order(order_id: str) -> None:
 taskiq worker my_app:broker
 ```
 
-默认的 consumer group 从 stream offset `0` 开始，因此第一个 worker 启动前
-已经发布的任务也会被消费。传入 `consumer_id="$"` 则只读取之后发布的任务。
+consumer group 固定从 stream offset `0` 开始，因此第一个 worker 启动前已经
+发布的任务也会被消费。
 
 ## 行为说明
 
@@ -49,6 +49,9 @@ taskiq worker my_app:broker
 ```
 
 多个应用共用同一个 Redis 时应使用不同的 `namespace`。默认值为 `taskiq`。
+
+每个 broker 实例都会生成独立的 Redis consumer 名称，且不支持配置。worker
+重启后会使用新的身份，前一个实例遗留的 pending entry 将继续走正常的恢复流程。
 
 `xread_count` 控制一次 `XREADGROUP` 拉取的消息数量。`max_pending` 独立限制
 一个 listener 已拉取但尚未成功确认的 entry 数量，二者默认都是 `100`。达到

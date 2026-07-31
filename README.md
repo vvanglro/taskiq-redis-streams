@@ -37,8 +37,8 @@ async def process_order(order_id: str) -> None:
 taskiq worker my_app:broker
 ```
 
-The group starts at `0` by default, so tasks published before the first worker
-starts are consumed. Pass `consumer_id="$"` to read only future messages.
+The consumer group always starts at `0`, so tasks published before the first
+worker starts are consumed.
 
 ## Behavior
 
@@ -51,6 +51,10 @@ One broker instance serves one Taskiq queue and uses these namespaced keys:
 
 Use a distinct `namespace` for applications that share Redis. The default is
 `taskiq`.
+
+Each broker instance generates its own Redis consumer name. Consumer names are
+not configurable, so a restarted worker receives a new identity and its
+predecessor's pending entries remain eligible for normal recovery.
 
 `xread_count` controls a single `XREADGROUP` batch. `max_pending` independently
 caps entries fetched by a listener but not successfully acknowledged; both
