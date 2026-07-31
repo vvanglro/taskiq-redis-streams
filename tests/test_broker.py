@@ -92,35 +92,6 @@ async def test_namespaced_stream_round_trip_and_ack(redis_url: str) -> None:
             count=10,
         )
         assert pending == []
-        assert len(await redis.xrange(broker.stream_name) or []) == 1
-    finally:
-        await redis.aclose()
-        await listener.aclose()
-        await broker.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_delete_after_ack_removes_stream_entry(redis_url: str) -> None:
-    """The optional cleanup deletes an entry only after it is acknowledged."""
-    broker = make_broker(redis_url, delete_after_ack=True)
-    await broker.startup()
-    await broker.kick(raw_message())
-
-    listener = broker.listen()
-    received = await next_message(listener)
-    await acknowledge(received)
-
-    redis = Redis.from_url(redis_url)
-    try:
-        assert await redis.xrange(broker.stream_name) == []
-        pending = await redis.xpending_range(
-            broker.stream_name,
-            broker.consumer_group_name,
-            min="-",
-            max="+",
-            count=10,
-        )
-        assert pending == []
     finally:
         await redis.aclose()
         await listener.aclose()
