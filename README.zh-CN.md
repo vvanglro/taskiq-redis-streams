@@ -79,6 +79,9 @@ listener 关闭时，只有仍在 broker 本地 buffer 内、尚未 yield 给 Ta
 会被交接给内部 `abandoned` consumer，并立即具备被下次 recovery scan 恢复的
 资格。已经 yield 的消息可能正在执行，因此仍遵循正常的确认或 reclaim 生命周期。
 
+listener 遇到可重试的 Redis 错误时，会从 100 ms 到 5 秒进行指数退避重试。
+Taskiq 的取消不会进入重试，而是向上传播，以便正常执行 listener 关闭时的消息交接。
+
 首个版本暂不支持 Redis Cluster、Sentinel、延迟任务和 stream 级死信队列。
 
 ## 开发

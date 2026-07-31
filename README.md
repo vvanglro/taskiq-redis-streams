@@ -84,6 +84,10 @@ an internal `abandoned` consumer and become reclaimable immediately. Already
 yielded messages may be executing, so they follow the normal acknowledge or
 reclaim lifecycle.
 
+Retryable Redis errors while listening are retried with exponential backoff from
+100 ms to 5 seconds. Cancellation from Taskiq is never retried; it propagates
+into the listener so the normal listener-close handoff can run.
+
 Redis Cluster, Sentinel, delayed tasks, and a stream-level dead-letter queue
 are not part of the first release.
 

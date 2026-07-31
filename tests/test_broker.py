@@ -9,11 +9,13 @@ from typing import Any
 
 import pytest
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from taskiq import AckableMessage
 from taskiq.message import BrokerMessage, TaskiqMessage
 from taskiq.utils import maybe_awaitable
 
 from taskiq_redis_streams import RedisStreamsBroker
+from taskiq_redis_streams import broker as broker_module
 from taskiq_redis_streams.broker import ABANDONED_CONSUMER
 
 
@@ -210,6 +212,104 @@ async def test_reclaim_can_be_disabled(redis_url: str) -> None:
     finally:
         await listener.aclose()
         await redis.aclose()
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_listen_retries_after_redis_error(
+    redis_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient Redis error does not terminate the listener."""
+    broker = make_broker(redis_url)
+    await broker.startup()
+    await broker.kick(raw_message())
+    original_read = broker._read_new_entries
+    attempts = 0
+
+    async def flaky_read(redis: Redis, count: int | None) -> list[Any]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RedisError("temporary connection failure")
+        return await original_read(redis, count)
+
+    monkeypatch.setattr(broker_module, "RETRY_INITIAL_DELAY", 0)
+    monkeypatch.setattr(broker, "_read_new_entries", flaky_read)
+    listener = broker.listen()
+    try:
+        received = await next_message(listener)
+        assert received.data == b"payload"
+        assert attempts == 2
+        await acknowledge(received)
+    finally:
+        await listener.aclose()
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_listen_retries_a_failed_reclaim_scan_immediately(
+    redis_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed reclaim scan does not consume the reclaim interval."""
+    broker = make_broker(redis_url)
+    await broker.startup()
+    await broker.kick(raw_message())
+    original_claim = broker._claim_overdue_entries
+    attempts = 0
+
+    async def flaky_claim(
+        redis: Redis,
+        limit: int,
+        protected: set[str],
+        pending_start: str,
+    ) -> tuple[list[Any], str]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RedisError("temporary connection failure")
+        return await original_claim(redis, limit, protected, pending_start)
+
+    monkeypatch.setattr(broker_module, "RETRY_INITIAL_DELAY", 0)
+    monkeypatch.setattr(broker, "_claim_overdue_entries", flaky_claim)
+    listener = broker.listen()
+    try:
+        received = await next_message(listener)
+        assert received.data == b"payload"
+        assert attempts == 2
+        await acknowledge(received)
+    finally:
+        await listener.aclose()
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_listen_cancellation_is_not_retried(
+    redis_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Taskiq shutdown cancellation exits a backoff sleep immediately."""
+    broker = make_broker(redis_url)
+    await broker.startup()
+    attempted_read = asyncio.Event()
+
+    async def unavailable_read(redis: Redis, count: int | None) -> list[Any]:
+        attempted_read.set()
+        raise RedisError("temporary connection failure")
+
+    monkeypatch.setattr(broker_module, "RETRY_INITIAL_DELAY", 60)
+    monkeypatch.setattr(broker, "_read_new_entries", unavailable_read)
+    listener = broker.listen()
+    listener_task = asyncio.create_task(anext(listener))
+    try:
+        await attempted_read.wait()
+        await asyncio.sleep(0)
+        listener_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await listener_task
+    finally:
+        await listener.aclose()
         await broker.shutdown()
 
 

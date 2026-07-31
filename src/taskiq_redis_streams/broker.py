@@ -22,6 +22,8 @@ logger = getLogger(__name__)
 
 ABANDONED_CONSUMER = "abandoned"
 ABANDONED_IDLE_MS = 10**12
+RETRY_INITIAL_DELAY = 0.1
+RETRY_MAX_DELAY = 5.0
 
 StreamEntry: TypeAlias = tuple[str, dict[bytes, bytes]]
 ConnectionPool: TypeAlias = BlockingConnectionPool
@@ -374,45 +376,58 @@ class RedisStreamsBroker(AsyncBroker):
 
         async with Redis(connection_pool=self.connection_pool) as redis:
             try:
+                retry_delay = RETRY_INITIAL_DELAY
                 while True:
-                    available = self._available_slots(pending)
-                    if available == 0:
-                        await slot_freed.wait()
-                        slot_freed.clear()
-                        continue
-
-                    if self.reclaim_enabled and self._reclaim_is_due(last_reclaim):
-                        last_reclaim = time.monotonic()
-                        reclaim_limit = available or self.reclaim_batch_size
-                        buffered, pending_start = await self._claim_overdue_entries(
-                            redis,
-                            reclaim_limit,
-                            delivered,
-                            pending_start,
-                        )
-
-                    if not buffered:
+                    try:
                         available = self._available_slots(pending)
-                        read_count = (
-                            self.xread_count
-                            if available is None
-                            else min(self.xread_count, available)
+                        if available == 0:
+                            await slot_freed.wait()
+                            slot_freed.clear()
+                            continue
+
+                        if self.reclaim_enabled and self._reclaim_is_due(last_reclaim):
+                            reclaim_limit = available or self.reclaim_batch_size
+                            buffered, pending_start = await self._claim_overdue_entries(
+                                redis,
+                                reclaim_limit,
+                                delivered,
+                                pending_start,
+                            )
+                            last_reclaim = time.monotonic()
+
+                        if not buffered:
+                            available = self._available_slots(pending)
+                            read_count = (
+                                self.xread_count
+                                if available is None
+                                else min(self.xread_count, available)
+                            )
+                            buffered = await self._read_new_entries(redis, read_count)
+
+                        pending += len(buffered)
+                        while buffered:
+                            message_id, entry = buffered.pop(0)
+                            delivered.add(message_id)
+
+                            def acknowledge(message_id: str = message_id) -> None:
+                                on_ack(message_id)
+
+                            yield self._ackable(
+                                message_id,
+                                entry,
+                                acknowledge,
+                            )
+                        retry_delay = RETRY_INITIAL_DELAY
+                    except asyncio.CancelledError:
+                        raise
+                    except RedisError:
+                        logger.warning(
+                            "Redis error while listening; retrying in %.1f seconds",
+                            retry_delay,
+                            exc_info=True,
                         )
-                        buffered = await self._read_new_entries(redis, read_count)
-
-                    pending += len(buffered)
-                    while buffered:
-                        message_id, entry = buffered.pop(0)
-                        delivered.add(message_id)
-
-                        def acknowledge(message_id: str = message_id) -> None:
-                            on_ack(message_id)
-
-                        yield self._ackable(
-                            message_id,
-                            entry,
-                            acknowledge,
-                        )
+                        await asyncio.sleep(retry_delay)
+                        retry_delay = min(retry_delay * 2, RETRY_MAX_DELAY)
             finally:
                 if self.reclaim_enabled:
                     await self._abandon_buffered_entries(redis, buffered)
