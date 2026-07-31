@@ -48,6 +48,7 @@ class RedisStreamsBroker(AsyncBroker):
         max_pending: int | None = 100,
         maxlen: int | None = None,
         approximate: bool = True,
+        reclaim_enabled: bool = True,
         reclaim_timeout: int = 600_000,
         reclaim_timeout_grace: int = 10_000,
         reclaim_interval: int = 30_000,
@@ -73,6 +74,8 @@ class RedisStreamsBroker(AsyncBroker):
             successfully acknowledged. ``None`` disables the local cap.
         :param maxlen: Optional Redis Stream length limit.
         :param approximate: Use Redis's approximate stream trimming when set.
+        :param reclaim_enabled: Enable automatic recovery of pending entries.
+            Set to ``False`` when recovery is managed outside this broker.
         :param reclaim_timeout: Fallback reclaim deadline in milliseconds for
             payloads without a valid Taskiq ``timeout`` label.
         :param reclaim_timeout_grace: Extra milliseconds added to a task's
@@ -122,6 +125,7 @@ class RedisStreamsBroker(AsyncBroker):
         self.max_pending = max_pending
         self.maxlen = maxlen
         self.approximate = approximate
+        self.reclaim_enabled = reclaim_enabled
         self.reclaim_timeout = reclaim_timeout
         self.reclaim_timeout_grace = reclaim_timeout_grace
         self.reclaim_interval = reclaim_interval
@@ -388,7 +392,7 @@ class RedisStreamsBroker(AsyncBroker):
                         slot_freed.clear()
                         continue
 
-                    if self._reclaim_is_due(last_reclaim):
+                    if self.reclaim_enabled and self._reclaim_is_due(last_reclaim):
                         last_reclaim = time.monotonic()
                         reclaim_limit = available or self.reclaim_batch_size
                         buffered, pending_start = await self._claim_overdue_entries(
@@ -421,4 +425,5 @@ class RedisStreamsBroker(AsyncBroker):
                             acknowledge,
                         )
             finally:
-                await self._abandon_buffered_entries(redis, buffered)
+                if self.reclaim_enabled:
+                    await self._abandon_buffered_entries(redis, buffered)

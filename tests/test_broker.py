@@ -163,6 +163,47 @@ async def test_fallback_reclaim_deadline_for_non_taskiq_payload(redis_url: str) 
 
 
 @pytest.mark.asyncio
+async def test_reclaim_can_be_disabled(redis_url: str) -> None:
+    """Disabled reclaim leaves a crashed consumer's pending entry untouched."""
+    broker = make_broker(
+        redis_url,
+        reclaim_enabled=False,
+        reclaim_timeout=1,
+        reclaim_interval=0,
+    )
+    await broker.startup()
+    await broker.kick(raw_message())
+
+    redis = Redis.from_url(redis_url)
+    listener = broker.listen()
+    try:
+        await redis.xreadgroup(
+            broker.consumer_group_name,
+            "crashed-worker",
+            {broker.stream_name: ">"},
+            count=1,
+        )
+        await asyncio.sleep(0.05)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(anext(listener), timeout=0.1)
+
+        pending = await redis.xpending_range(
+            broker.stream_name,
+            broker.consumer_group_name,
+            min="-",
+            max="+",
+            count=10,
+        )
+        assert len(pending) == 1
+        assert as_text(pending[0]["consumer"]) == "crashed-worker"
+    finally:
+        await listener.aclose()
+        await redis.aclose()
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_max_pending_limits_entries_reserved_in_pel(redis_url: str) -> None:
     """Local backpressure keeps a second entry out of the PEL until ACK."""
     broker = make_broker(redis_url, xread_count=10, max_pending=1)

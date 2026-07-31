@@ -66,6 +66,13 @@ Messages without a readable timeout use `reclaim_timeout`. `XCLAIM` performs
 the final deadline check atomically in Redis, so no distributed reclaim lock is
 needed. Reclaimed entries are handled before new entries when a scan is due.
 
+Set `reclaim_enabled=False` to disable all automatic PEL recovery. In this
+mode, the broker neither scans pending entries nor hands buffered entries to
+the `abandoned` consumer when a listener closes. This is useful when the
+application owns recovery policy for long-running tasks. Unacknowledged tasks
+must then be recovered explicitly with Redis commands or a broker configured
+with reclaim enabled.
+
 On listener close, only messages still in the broker-local buffer are handed to
 an internal `abandoned` consumer and become reclaimable immediately. Already
 yielded messages may be executing, so they follow the normal acknowledge or
