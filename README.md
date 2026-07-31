@@ -1,5 +1,7 @@
 # taskiq-redis-streams
 
+[中文文档](README.zh-CN.md)
+
 An independent, single-node Redis Streams broker for
 [Taskiq](https://taskiq-python.github.io/). It uses bounded local prefetch and
 timeout-aware pending-entry recovery.
