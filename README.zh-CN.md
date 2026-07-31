@@ -55,6 +55,11 @@ taskiq worker my_app:broker
 上限后，listener 不会继续占用新的 stream entry，从而让同一 group 中的其他
 consumer 有机会获取任务。设置 `max_pending=None` 可关闭这一项本地限制。
 
+默认情况下，确认会将 entry 从 PEL 移除，但仍保留在 Stream 中。设置
+`delete_after_ack=True` 后，会在成功 `XACK` 后执行 `XDEL`，以减少历史消息的
+存储。删除后的 entry 无法检查或重放；若仍希望保留最近的历史，优先使用
+`maxlen`。
+
 broker 会定期扫描 consumer group 的 pending entries list (PEL)。对于包含
 `timeout` label 的序列化 Taskiq 消息，entry 在以下时间后可以被 reclaim：
 

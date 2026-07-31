@@ -48,6 +48,7 @@ class RedisStreamsBroker(AsyncBroker):
         max_pending: int | None = 100,
         maxlen: int | None = None,
         approximate: bool = True,
+        delete_after_ack: bool = False,
         reclaim_enabled: bool = True,
         reclaim_timeout: int = 600_000,
         reclaim_timeout_grace: int = 10_000,
@@ -74,6 +75,8 @@ class RedisStreamsBroker(AsyncBroker):
             successfully acknowledged. ``None`` disables the local cap.
         :param maxlen: Optional Redis Stream length limit.
         :param approximate: Use Redis's approximate stream trimming when set.
+        :param delete_after_ack: Delete an entry from the Stream after its
+            successful final acknowledgement. This removes message history.
         :param reclaim_enabled: Enable automatic recovery of pending entries.
             Set to ``False`` when recovery is managed outside this broker.
         :param reclaim_timeout: Fallback reclaim deadline in milliseconds for
@@ -125,6 +128,7 @@ class RedisStreamsBroker(AsyncBroker):
         self.max_pending = max_pending
         self.maxlen = maxlen
         self.approximate = approximate
+        self.delete_after_ack = delete_after_ack
         self.reclaim_enabled = reclaim_enabled
         self.reclaim_timeout = reclaim_timeout
         self.reclaim_timeout_grace = reclaim_timeout_grace
@@ -315,11 +319,22 @@ class RedisStreamsBroker(AsyncBroker):
             if acked:
                 return
             async with Redis(connection_pool=self.connection_pool) as redis:
-                await redis.xack(
+                acknowledged = await redis.xack(
                     self.stream_name,
                     self.consumer_group_name,
                     message_id,
                 )
+                if self.delete_after_ack and acknowledged:
+                    try:
+                        await redis.xdel(self.stream_name, message_id)
+                    except RedisError:
+                        # XACK has already completed, so this cleanup failure
+                        # must not retain the listener's local prefetch slot.
+                        logger.warning(
+                            "Unable to delete acknowledged Redis Stream entry %s",
+                            message_id,
+                            exc_info=True,
+                        )
             acked = True
             on_ack()
 

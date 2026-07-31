@@ -57,6 +57,11 @@ caps entries fetched by a listener but not successfully acknowledged; both
 default to `100`. Once the cap is reached, the listener leaves new work for
 other consumers. Set `max_pending=None` to disable that local cap.
 
+By default, acknowledgement removes an entry from the PEL but retains it in
+the Stream. Set `delete_after_ack=True` to run `XDEL` after a successful
+`XACK` and minimize stored history. Deleted entries cannot be inspected or
+replayed; prefer `maxlen` when retaining a recent history is useful.
+
 The broker scans the consumer group's PEL periodically. A serialized Taskiq
 message with a `timeout` label is reclaimable after:
 
