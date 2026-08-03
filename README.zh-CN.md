@@ -17,12 +17,22 @@ uv add taskiq-redis-streams
 ## 使用方法
 
 ```python
-from taskiq_redis_streams import RedisStreamsBroker
+from taskiq_redis_streams import RedisAsyncResultBackend, RedisStreamsBroker
+
+redis_url = "redis://localhost:6379/0"
+
+result_backend = RedisAsyncResultBackend(
+    redis_url,
+    result_ex_time=3600,
+    prefix_str="my-service:result",
+)
 
 broker = RedisStreamsBroker(
-    "redis://localhost:6379/0",
+    redis_url,
     queue_name="default",
     namespace="my-service",
+).with_result_backend(
+    result_backend,
 )
 
 
@@ -55,6 +65,7 @@ consumer group 固定从 stream offset `0` 开始，因此第一个 worker 启�
   consumer，并可被立即恢复。
 - 可重试的 Redis listener 错误使用指数退避；Taskiq 取消会向上传播，确保关闭时的
   消息交接逻辑能够执行。
+- Redis result backend：支持可选 TTL、进度保存、一次性读取和可配置 key 前缀。
 
 ## 投递与恢复流程
 
@@ -114,6 +125,18 @@ heartbeat 已过期的 pending entry 会进入恢复流程。
 
 设置 `maxlen` 时，producer 会使用 Redis 近似的 `XADD MAXLEN ~` 修剪来限制
 Stream 历史长度。应保守设置：修剪可能删除尚未处理完成的 entry。
+
+## Result Backend
+
+`RedisAsyncResultBackend` 是通过 Taskiq `with_result_backend(...)` API 使用的
+单节点 Redis result backend。它会将序列化后的结果和进度分别存储在
+`<prefix_str>:<task_id>` 与 `<prefix_str>:<task_id>__progress`。
+为了兼容 `taskiq-redis`，未设置 `prefix_str` 时 task ID 本身就是 Redis key；多个
+服务共用 Redis 时应设置不同前缀。
+
+设置 `result_ex_time`（秒）或 `result_px_time`（毫秒）中的一个，可同时为结果和
+进度设置过期时间；二者均未设置时会永久保存。`keep_results=False` 会在第一次
+`get_result()` 时原子地消费结果。长期运行的部署应设置 TTL，避免 Redis 存储无限增长。
 
 `max_connection_pool_size` 只限制任务投递相关命令使用的连接。broker 会在独立线程中
 使用额外的 Redis 连接续写 heartbeat，因此阻塞读取或普通 event loop 停顿不会饿死

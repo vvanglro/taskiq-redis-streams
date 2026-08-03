@@ -18,12 +18,22 @@ uv add taskiq-redis-streams
 ## Usage
 
 ```python
-from taskiq_redis_streams import RedisStreamsBroker
+from taskiq_redis_streams import RedisAsyncResultBackend, RedisStreamsBroker
+
+redis_url = "redis://localhost:6379/0"
+
+result_backend = RedisAsyncResultBackend(
+    redis_url,
+    result_ex_time=3600,
+    prefix_str="my-service:result",
+)
 
 broker = RedisStreamsBroker(
-    "redis://localhost:6379/0",
+    redis_url,
     queue_name="default",
     namespace="my-service",
+).with_result_backend(
+    result_backend,
 )
 
 
@@ -57,6 +67,8 @@ worker starts are consumed.
   an internal `abandoned` consumer and are reclaimable immediately.
 - Retryable Redis listener errors use exponential backoff; Taskiq cancellation
   is propagated so shutdown handoff still runs.
+- Redis result backend with optional TTLs, progress storage, one-shot reads, and
+  configurable key prefixes.
 
 ## Delivery and Recovery Flow
 
@@ -119,6 +131,20 @@ capacity. Empty reads use an internal `3000` ms Redis long-poll timeout.
 When `maxlen` is set, producers use Redis's approximate `XADD MAXLEN ~`
 trimming to control Stream history. Choose it conservatively: trimming can
 remove entries that have not yet been processed.
+
+## Result Backend
+
+`RedisAsyncResultBackend` is the single-node Redis result backend compatible
+with Taskiq's `with_result_backend(...)` API. It stores serialized results and
+progress under `<prefix_str>:<task_id>` and `<prefix_str>:<task_id>__progress`.
+Without `prefix_str`, the task ID itself is the Redis key for compatibility with
+`taskiq-redis`; set a distinct prefix when Redis is shared with other services.
+
+Set exactly one of `result_ex_time` (seconds) or `result_px_time`
+(milliseconds) to expire both results and progress. Leaving both unset keeps
+them indefinitely. `keep_results=False` consumes a result atomically on its
+first `get_result()` call. Use a TTL for long-running deployments to prevent
+unbounded Redis storage.
 
 `max_connection_pool_size` applies to task delivery commands. The broker keeps
 one separate Redis connection in a heartbeat thread, so a blocking read or an
