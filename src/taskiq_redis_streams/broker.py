@@ -31,6 +31,8 @@ ABANDONED_IDLE_MS = 10**12
 RETRY_INITIAL_DELAY = 0.1
 RETRY_MAX_DELAY = 5.0
 HEARTBEAT_THREAD_JOIN_TIMEOUT = 1.0
+XREAD_BLOCK_MS = 3_000
+XREAD_BATCH_SIZE = 10
 
 _CLAIM_IF_HEARTBEAT_MISSING = """
 local pending = redis.call('XPENDING', KEYS[2], ARGV[1], ARGV[4], ARGV[4], 1)
@@ -66,11 +68,8 @@ class RedisStreamsBroker(AsyncBroker):
         *,
         queue_name: str = "taskiq",
         namespace: str = "taskiq",
-        xread_block: int = 2_000,
-        xread_count: int = 100,
-        max_pending: int | None = 100,
+        max_pending: int | None = 10,
         maxlen: int | None = None,
-        approximate: bool = True,
         reclaim_interval: int = 10_000,
         reclaim_batch_size: int = 100,
         consumer_heartbeat_interval: int = 10_000,
@@ -83,12 +82,9 @@ class RedisStreamsBroker(AsyncBroker):
         :param url: Redis connection URL.
         :param queue_name: Taskiq queue represented by this broker.
         :param namespace: Prefix used for the stream and default group keys.
-        :param xread_block: Maximum XREADGROUP block time in milliseconds.
-        :param xread_count: Maximum number of entries fetched per XREADGROUP.
         :param max_pending: Maximum entries delivered to this listener but not
             successfully acknowledged. ``None`` disables the local cap.
         :param maxlen: Optional Redis Stream length limit.
-        :param approximate: Use Redis's approximate stream trimming when set.
         :param reclaim_interval: Milliseconds between PEL recovery scans. Set
             to ``0`` to scan before every read.
         :param reclaim_batch_size: Maximum PEL entries examined in one scan.
@@ -105,10 +101,6 @@ class RedisStreamsBroker(AsyncBroker):
 
         if not namespace:
             raise ValueError("namespace must not be empty")
-        if xread_block < 0:
-            raise ValueError("xread_block must be non-negative")
-        if xread_count <= 0:
-            raise ValueError("xread_count must be greater than zero")
         if max_pending is not None and max_pending <= 0:
             raise ValueError("max_pending must be greater than zero or None")
         if reclaim_interval < 0:
@@ -152,11 +144,8 @@ class RedisStreamsBroker(AsyncBroker):
             namespace,
             self.consumer_name,
         )
-        self.xread_block = xread_block
-        self.xread_count = xread_count
         self.max_pending = max_pending
         self.maxlen = maxlen
-        self.approximate = approximate
         self.reclaim_interval = reclaim_interval
         self.reclaim_batch_size = reclaim_batch_size
         self.consumer_heartbeat_interval = consumer_heartbeat_interval
@@ -196,7 +185,7 @@ class RedisStreamsBroker(AsyncBroker):
                 self.stream_name,
                 {b"data": message.message},
                 maxlen=self.maxlen,
-                approximate=self.approximate,
+                approximate=True,
             )
 
     def _available_slots(self, pending: int) -> int | None:
@@ -395,7 +384,7 @@ class RedisStreamsBroker(AsyncBroker):
             self.consumer_name,
             {self.stream_name: ">"},
             count=count,
-            block=self.xread_block,
+            block=XREAD_BLOCK_MS,
         )
         entries: list[StreamEntry] = []
         stream_response = cast("list[tuple[Any, list[tuple[Any, Any]]]]", fetched)
@@ -515,9 +504,9 @@ class RedisStreamsBroker(AsyncBroker):
                         if not buffered:
                             available = self._available_slots(pending)
                             read_count = (
-                                self.xread_count
+                                XREAD_BATCH_SIZE
                                 if available is None
-                                else min(self.xread_count, available)
+                                else min(XREAD_BATCH_SIZE, available)
                             )
                             buffered = await self._read_new_entries(redis, read_count)
 

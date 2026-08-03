@@ -45,8 +45,8 @@ worker starts are consumed.
 - One namespaced Redis Stream and consumer group per Taskiq queue.
 - At-least-once delivery through Redis Streams consumer groups; task handlers
   must be idempotent.
-- Bounded broker-local prefetch: `xread_count` limits each read and
-  `max_pending` caps fetched-but-unacknowledged entries per listener.
+- Bounded broker-local prefetch: `max_pending` caps fetched-but-unacknowledged
+  entries per listener.
 - Consumer-heartbeat recovery: live workers can run arbitrarily long tasks
   without recovery being tied to a task execution timeout.
 - Atomic orphan reclaim: Redis verifies that the PEL owner is unchanged and
@@ -109,10 +109,16 @@ not configurable, so a restarted worker receives a new identity. Active worker
 consumers renew a Redis TTL heartbeat and pending entries owned by a consumer
 whose heartbeat has expired are eligible for recovery.
 
-`xread_count` controls a single `XREADGROUP` batch. `max_pending` independently
-caps entries fetched by a listener but not successfully acknowledged; both
-default to `100`. Once the cap is reached, the listener leaves new work for
-other consumers. Set `max_pending=None` to disable that local cap.
+`max_pending` caps entries fetched by a listener but not successfully
+acknowledged; it defaults to `10`. Once the cap is reached, the listener leaves
+new work for other consumers. Set `max_pending=1` to reserve one task at a time,
+or `max_pending=None` to disable the local cap. Redis reads use an internal
+batch size of at most `10`, always bounded by the remaining `max_pending`
+capacity. Empty reads use an internal `3000` ms Redis long-poll timeout.
+
+When `maxlen` is set, producers use Redis's approximate `XADD MAXLEN ~`
+trimming to control Stream history. Choose it conservatively: trimming can
+remove entries that have not yet been processed.
 
 `max_connection_pool_size` applies to task delivery commands. The broker keeps
 one separate Redis connection in a heartbeat thread, so a blocking read or an

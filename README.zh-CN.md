@@ -43,8 +43,8 @@ consumer group 固定从 stream offset `0` 开始，因此第一个 worker 启�
 
 - 每个 Taskiq queue 使用一个带命名空间的 Redis Stream 和 consumer group。
 - 基于 Redis Streams consumer group 提供至少一次投递语义，任务处理必须幂等。
-- 受限的 broker 本地预取：`xread_count` 限制单次读取，`max_pending` 限制每个
-  listener 已拉取但尚未确认的 entry 数量。
+- 受限的 broker 本地预取：`max_pending` 限制每个 listener 已拉取但尚未确认的
+  entry 数量。
 - 基于 consumer heartbeat 的恢复机制：存活 worker 可执行任意时长的任务，恢复
   不依赖任务执行超时。
 - 原子 orphan reclaim：Redis 会确认 PEL owner 未变化且 heartbeat 不存在后，才通过
@@ -105,10 +105,15 @@ flowchart TD
 重启后会使用新的身份。活跃 worker consumer 会续写 Redis TTL heartbeat；owner
 heartbeat 已过期的 pending entry 会进入恢复流程。
 
-`xread_count` 控制一次 `XREADGROUP` 拉取的消息数量。`max_pending` 独立限制
-一个 listener 已拉取但尚未成功确认的 entry 数量，二者默认都是 `100`。达到
-上限后，listener 不会继续占用新的 stream entry，从而让同一 group 中的其他
-consumer 有机会获取任务。设置 `max_pending=None` 可关闭这一项本地限制。
+`max_pending` 限制一个 listener 已拉取但尚未成功确认的 entry 数量，默认是
+`10`。达到上限后，listener 不会继续占用新的 stream entry，从而让同一 group 中的
+其他 consumer 有机会获取任务。设置 `max_pending=1` 可一次只占用一个任务；设置
+`max_pending=None` 可关闭这一项本地限制。Redis 单次读取使用内部 `10` 条上限，但
+始终会受剩余 `max_pending` 容量限制；空队列读取使用内部 `3000` 毫秒的 Redis 长轮询
+超时。
+
+设置 `maxlen` 时，producer 会使用 Redis 近似的 `XADD MAXLEN ~` 修剪来限制
+Stream 历史长度。应保守设置：修剪可能删除尚未处理完成的 entry。
 
 `max_connection_pool_size` 只限制任务投递相关命令使用的连接。broker 会在独立线程中
 使用额外的 Redis 连接续写 heartbeat，因此阻塞读取或普通 event loop 停顿不会饿死

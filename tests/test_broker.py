@@ -23,12 +23,10 @@ from taskiq_redis_streams.broker import ABANDONED_CONSUMER
 
 def make_broker(redis_url: str, **kwargs: Any) -> RedisStreamsBroker:
     """Build a broker whose Redis keys cannot overlap another test's keys."""
-    xread_block = kwargs.pop("xread_block", 20)
     return RedisStreamsBroker(
         redis_url,
         queue_name="jobs",
         namespace=f"test-{uuid.uuid4().hex}",
-        xread_block=xread_block,
         **kwargs,
     )
 
@@ -67,6 +65,9 @@ def test_broker_generates_unique_consumer_names() -> None:
 
     assert first.consumer_name.startswith("worker-")
     assert first.consumer_name != second.consumer_name
+    assert first.max_pending == 10
+    assert broker_module.XREAD_BATCH_SIZE == 10
+    assert broker_module.XREAD_BLOCK_MS == 3_000
 
 
 @pytest.mark.asyncio
@@ -152,7 +153,6 @@ async def test_live_consumer_heartbeat_prevents_reclaim(redis_url: str) -> None:
         redis_url,
         queue_name=first.queue_name,
         namespace=first.namespace,
-        xread_block=20,
         consumer_heartbeat_interval=10,
         consumer_heartbeat_ttl=30,
         reclaim_interval=0,
@@ -220,7 +220,6 @@ async def test_heartbeat_uses_a_dedicated_connection_pool(redis_url: str) -> Non
     """A blocking listener cannot prevent heartbeat lease renewal."""
     broker = make_broker(
         redis_url,
-        xread_block=0,
         max_connection_pool_size=1,
         consumer_heartbeat_interval=10,
         consumer_heartbeat_ttl=60,
@@ -289,7 +288,6 @@ async def test_clean_shutdown_allows_immediate_reclaim(redis_url: str) -> None:
         redis_url,
         queue_name=first.queue_name,
         namespace=first.namespace,
-        xread_block=20,
         consumer_heartbeat_interval=10,
         consumer_heartbeat_ttl=10_000,
         reclaim_interval=0,
@@ -427,7 +425,7 @@ async def test_listen_cancellation_is_not_retried(
 @pytest.mark.asyncio
 async def test_max_pending_limits_entries_reserved_in_pel(redis_url: str) -> None:
     """Local backpressure keeps a second entry out of the PEL until ACK."""
-    broker = make_broker(redis_url, xread_count=10, max_pending=1)
+    broker = make_broker(redis_url, max_pending=1)
     await broker.startup()
     await broker.kick(raw_message(b"first"))
     await broker.kick(raw_message(b"second"))
@@ -462,7 +460,6 @@ async def test_close_hands_unyielded_buffer_to_abandoned_consumer(
     """Closing a listener makes its locally buffered entries recoverable now."""
     broker = make_broker(
         redis_url,
-        xread_count=2,
         max_pending=2,
         reclaim_interval=0,
     )
@@ -489,7 +486,6 @@ async def test_close_hands_unyielded_buffer_to_abandoned_consumer(
             redis_url,
             queue_name=broker.queue_name,
             namespace=broker.namespace,
-            xread_block=20,
             reclaim_interval=0,
         )
         await replacement.startup()
