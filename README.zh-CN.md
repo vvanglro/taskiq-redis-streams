@@ -39,6 +39,56 @@ taskiq worker my_app:broker
 consumer group 固定从 stream offset `0` 开始，因此第一个 worker 启动前已经
 发布的任务也会被消费。
 
+## 特性
+
+- 每个 Taskiq queue 使用一个带命名空间的 Redis Stream 和 consumer group。
+- 基于 Redis Streams consumer group 提供至少一次投递语义，任务处理必须幂等。
+- 受限的 broker 本地预取：`xread_count` 限制单次读取，`max_pending` 限制每个
+  listener 已拉取但尚未确认的 entry 数量。
+- 基于 consumer heartbeat 的恢复机制：存活 worker 可执行任意时长的任务，恢复
+  不依赖任务执行超时。
+- 原子 orphan reclaim：Redis 会确认 PEL owner 未变化且 heartbeat 不存在后，才通过
+  `XCLAIM` 转移 entry。
+- heartbeat 使用独立连接，因此即使任务投递连接池受限且 `XREADGROUP` 阻塞，也不会
+  饿死 consumer lease 的续写。
+- listener 关闭时，仍在 broker 本地 buffer 中的 entry 会交接到内部 `abandoned`
+  consumer，并可被立即恢复。
+- 可重试的 Redis listener 错误使用指数退避；Taskiq 取消会向上传播，确保关闭时的
+  消息交接逻辑能够执行。
+
+## 投递与恢复流程
+
+```mermaid
+flowchart TD
+    producer[Taskiq producer] -->|XADD data| stream[(Redis Stream)]
+    startup[Worker startup] --> group[XGROUP CREATE consumer group]
+    group --> listener[Broker listen loop]
+    listener --> heartbeat[Refresh consumer heartbeat TTL]
+    heartbeat --> capacity{max_pending slot available?}
+    capacity -->|no| wait_ack[Wait for a successful ACK]
+    wait_ack --> capacity
+    capacity -->|yes| reclaim_due{Reclaim scan due?}
+    reclaim_due -->|yes| pending[XPENDING RANGE]
+    pending --> lease{Owner heartbeat exists?}
+    lease -->|no| claim[Lua: verify PEL owner then XCLAIM]
+    lease -->|yes| read
+    reclaim_due -->|no| read
+    stream --> read[XREADGROUP new entries]
+    claim --> buffer[Broker-local buffer]
+    read --> buffer
+    buffer --> deliver[Yield AckableMessage to Taskiq]
+    deliver --> execute[Execute task]
+    execute --> ack[Taskiq 确认时执行 XACK]
+    ack --> capacity
+
+    listener_close[Listener cancellation or close] --> buffered{Still in local buffer?}
+    buffered -->|yes| abandoned[XCLAIM to abandoned consumer]
+    buffered -->|already yielded| drain[Keep heartbeat until broker shutdown]
+    worker_loss[Crash or forced stop] --> expired[Heartbeat TTL expires]
+    expired --> pending
+    abandoned --> pending
+```
+
 ## 行为说明
 
 每个 broker 实例服务于一个 Taskiq queue，并使用以下带命名空间的 Redis key：

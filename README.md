@@ -40,6 +40,57 @@ taskiq worker my_app:broker
 The consumer group always starts at `0`, so tasks published before the first
 worker starts are consumed.
 
+## Features
+
+- One namespaced Redis Stream and consumer group per Taskiq queue.
+- At-least-once delivery through Redis Streams consumer groups; task handlers
+  must be idempotent.
+- Bounded broker-local prefetch: `xread_count` limits each read and
+  `max_pending` caps fetched-but-unacknowledged entries per listener.
+- Consumer-heartbeat recovery: live workers can run arbitrarily long tasks
+  without recovery being tied to a task execution timeout.
+- Atomic orphan reclaim: Redis verifies that the PEL owner is unchanged and
+  its heartbeat is absent before `XCLAIM` transfers an entry.
+- A dedicated heartbeat connection, so a blocking `XREADGROUP` cannot starve
+  liveness renewal when the task delivery pool is constrained.
+- Fast listener-close handoff: entries still buffered inside the broker move to
+  an internal `abandoned` consumer and are reclaimable immediately.
+- Retryable Redis listener errors use exponential backoff; Taskiq cancellation
+  is propagated so shutdown handoff still runs.
+
+## Delivery and Recovery Flow
+
+```mermaid
+flowchart TD
+    producer[Taskiq producer] -->|XADD data| stream[(Redis Stream)]
+    startup[Worker startup] --> group[XGROUP CREATE consumer group]
+    group --> listener[Broker listen loop]
+    listener --> heartbeat[Refresh consumer heartbeat TTL]
+    heartbeat --> capacity{max_pending slot available?}
+    capacity -->|no| wait_ack[Wait for a successful ACK]
+    wait_ack --> capacity
+    capacity -->|yes| reclaim_due{Reclaim scan due?}
+    reclaim_due -->|yes| pending[XPENDING RANGE]
+    pending --> lease{Owner heartbeat exists?}
+    lease -->|no| claim[Lua: verify PEL owner then XCLAIM]
+    lease -->|yes| read
+    reclaim_due -->|no| read
+    stream --> read[XREADGROUP new entries]
+    claim --> buffer[Broker-local buffer]
+    read --> buffer
+    buffer --> deliver[Yield AckableMessage to Taskiq]
+    deliver --> execute[Execute task]
+    execute --> ack[XACK when Taskiq acknowledges]
+    ack --> capacity
+
+    listener_close[Listener cancellation or close] --> buffered{Still in local buffer?}
+    buffered -->|yes| abandoned[XCLAIM to abandoned consumer]
+    buffered -->|already yielded| drain[Keep heartbeat until broker shutdown]
+    worker_loss[Crash or forced stop] --> expired[Heartbeat TTL expires]
+    expired --> pending
+    abandoned --> pending
+```
+
 ## Behavior
 
 One broker instance serves one Taskiq queue and uses these namespaced keys:
