@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import suppress
@@ -199,7 +200,7 @@ async def test_heartbeat_expires_after_configured_lease_ttl(
     received = await next_message(listener)
     redis = Redis.from_url(redis_url)
 
-    async def unavailable_heartbeat() -> None:
+    def unavailable_heartbeat() -> None:
         raise RedisError("temporary connection failure")
 
     monkeypatch.setattr(broker, "_refresh_heartbeat", unavailable_heartbeat)
@@ -240,6 +241,31 @@ async def test_heartbeat_uses_a_dedicated_connection_pool(redis_url: str) -> Non
         await listener.aclose()
         await acknowledge(received)
         await redis.aclose()
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_thread_survives_event_loop_blocking(redis_url: str) -> None:
+    """CPU work in the event loop does not stop the worker liveness lease."""
+    broker = make_broker(
+        redis_url,
+        consumer_heartbeat_interval=10,
+        consumer_heartbeat_ttl=60,
+    )
+    await broker.startup()
+    await broker.kick(raw_message())
+    listener = broker.listen()
+    received = await next_message(listener)
+    redis = Redis.from_url(redis_url)
+    try:
+        deadline = time.monotonic() + 0.1
+        while time.monotonic() < deadline:
+            pass
+        assert await redis.exists(broker.consumer_heartbeat_key)
+        await acknowledge(received)
+    finally:
+        await redis.aclose()
+        await listener.aclose()
         await broker.shutdown()
 
 

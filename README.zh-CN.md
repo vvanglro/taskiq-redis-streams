@@ -49,8 +49,8 @@ consumer group 固定从 stream offset `0` 开始，因此第一个 worker 启�
   不依赖任务执行超时。
 - 原子 orphan reclaim：Redis 会确认 PEL owner 未变化且 heartbeat 不存在后，才通过
   `XCLAIM` 转移 entry。
-- heartbeat 使用独立连接，因此即使任务投递连接池受限且 `XREADGROUP` 阻塞，也不会
-  饿死 consumer lease 的续写。
+- heartbeat 使用独立线程和 Redis 连接，使其独立于普通的 event loop 停顿和任务投递
+  连接池受限时的 `XREADGROUP` 阻塞。
 - listener 关闭时，仍在 broker 本地 buffer 中的 entry 会交接到内部 `abandoned`
   consumer，并可被立即恢复。
 - 可重试的 Redis listener 错误使用指数退避；Taskiq 取消会向上传播，确保关闭时的
@@ -63,7 +63,7 @@ flowchart TD
     producer[Taskiq producer] -->|XADD data| stream[(Redis Stream)]
     startup[Worker startup] --> group[XGROUP CREATE consumer group]
     group --> listener[Broker listen loop]
-    listener --> heartbeat[Refresh consumer heartbeat TTL]
+    listener --> heartbeat[后台 heartbeat 线程续写 TTL]
     heartbeat --> capacity{max_pending slot available?}
     capacity -->|no| wait_ack[Wait for a successful ACK]
     wait_ack --> capacity
@@ -110,16 +110,21 @@ heartbeat 已过期的 pending entry 会进入恢复流程。
 上限后，listener 不会继续占用新的 stream entry，从而让同一 group 中的其他
 consumer 有机会获取任务。设置 `max_pending=None` 可关闭这一项本地限制。
 
-`max_connection_pool_size` 只限制任务投递相关命令使用的连接。broker 会额外保留
-一个 Redis 连接用于 heartbeat 续写，因此阻塞读取不会阻塞 consumer lease 的续写。
+`max_connection_pool_size` 只限制任务投递相关命令使用的连接。broker 会在独立线程中
+使用额外的 Redis 连接续写 heartbeat，因此阻塞读取或普通 event loop 停顿不会饿死
+consumer lease 的续写。
 
 broker 会定期扫描 consumer group 的 pending entries list (PEL)。每个活跃
 consumer 会按 `consumer_heartbeat_interval`（默认 `10000` 毫秒）续写 heartbeat。
-每次成功续写后，heartbeat 在 `consumer_heartbeat_ttl`（默认 `30000` 毫秒）内
-保持有效；租约过期后，下一次 PEL scan 会恢复该 consumer 的 entry。`XCLAIM`
-前会在 Redis 内原子检查 heartbeat，因此并发 worker 不会同时恢复同一条 entry。
-TTL 应大于续写间隔，以容纳正常的调度延迟和 Redis 网络延迟。reclaim scan 到期时，
-已恢复的 entry 会优先于新消息处理。
+每次成功续写后，heartbeat 在 `consumer_heartbeat_ttl`（默认 `60000` 毫秒）内
+保持有效；PEL scan 按 `reclaim_interval`（默认 `10000` 毫秒）执行。租约过期后，
+下一次 PEL scan 会恢复该 consumer 的 entry。`XCLAIM` 前会在 Redis 内原子检查
+heartbeat，因此并发 worker 不会同时恢复同一条 entry。TTL 应大于续写间隔，以容纳
+正常的调度延迟和 Redis 网络延迟。reclaim scan 到期时，已恢复的 entry 会优先于
+新消息处理。
+
+heartbeat 表示 worker 进程存活，而不是任务已经完成。宿主机暂停或网络分区仍可能让
+lease 在任务稍后恢复执行前过期，因此任务处理仍必须保持幂等。
 
 Taskiq 的 `timeout` label 仍控制任务执行时限，但不再控制 Redis Streams 恢复。
 因此活跃 worker 可以执行长任务，而不会仅因任务持续时间过长就被 reclaim。

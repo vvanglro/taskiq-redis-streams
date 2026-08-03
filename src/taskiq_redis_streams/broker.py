@@ -6,10 +6,12 @@ import asyncio
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
-from contextlib import suppress
 from logging import getLogger
+from threading import Event, Thread
 from typing import Any, TypeAlias, cast
 
+from redis import BlockingConnectionPool as SyncBlockingConnectionPool
+from redis import Redis as SyncRedis
 from redis.asyncio import BlockingConnectionPool, Redis
 from redis.exceptions import RedisError, ResponseError
 from taskiq import AckableMessage
@@ -28,6 +30,7 @@ ABANDONED_CONSUMER = "abandoned"
 ABANDONED_IDLE_MS = 10**12
 RETRY_INITIAL_DELAY = 0.1
 RETRY_MAX_DELAY = 5.0
+HEARTBEAT_THREAD_JOIN_TIMEOUT = 1.0
 
 _CLAIM_IF_HEARTBEAT_MISSING = """
 local pending = redis.call('XPENDING', KEYS[2], ARGV[1], ARGV[4], ARGV[4], 1)
@@ -68,10 +71,10 @@ class RedisStreamsBroker(AsyncBroker):
         max_pending: int | None = 100,
         maxlen: int | None = None,
         approximate: bool = True,
-        reclaim_interval: int = 30_000,
+        reclaim_interval: int = 10_000,
         reclaim_batch_size: int = 100,
         consumer_heartbeat_interval: int = 10_000,
-        consumer_heartbeat_ttl: int = 30_000,
+        consumer_heartbeat_ttl: int = 60_000,
         max_connection_pool_size: int | None = None,
         **connection_kwargs: Any,
     ) -> None:
@@ -90,12 +93,12 @@ class RedisStreamsBroker(AsyncBroker):
             to ``0`` to scan before every read.
         :param reclaim_batch_size: Maximum PEL entries examined in one scan.
         :param consumer_heartbeat_interval: Milliseconds between liveness
-            lease renewals for this Redis consumer.
+            lease renewals in the dedicated heartbeat thread.
         :param consumer_heartbeat_ttl: Milliseconds an unrefreshed consumer
             heartbeat remains live before its pending entries are reclaimable.
         :param max_connection_pool_size: Maximum Redis connections used for
-            task delivery commands. Heartbeat renewal uses one separate
-            connection so a blocking read cannot starve the liveness lease.
+            task delivery commands. The heartbeat thread uses one separate
+            Redis connection so a blocking read cannot starve the lease.
         :param connection_kwargs: Extra arguments accepted by redis-py.
         """
         super().__init__()
@@ -128,12 +131,13 @@ class RedisStreamsBroker(AsyncBroker):
             max_connections=max_connection_pool_size,
             **connection_kwargs,
         )
-        self.heartbeat_connection_pool: ConnectionPool = (
-            BlockingConnectionPool.from_url(
-                url,
-                max_connections=1,
-                **connection_kwargs,
-            )
+        self.heartbeat_connection_pool = SyncBlockingConnectionPool.from_url(
+            url,
+            max_connections=1,
+            **connection_kwargs,
+        )
+        self._heartbeat_redis = SyncRedis(
+            connection_pool=self.heartbeat_connection_pool,
         )
         self.queue_name = queue_name
         self.namespace = namespace
@@ -157,7 +161,8 @@ class RedisStreamsBroker(AsyncBroker):
         self.reclaim_batch_size = reclaim_batch_size
         self.consumer_heartbeat_interval = consumer_heartbeat_interval
         self.consumer_heartbeat_ttl = consumer_heartbeat_ttl
-        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._heartbeat_stop = Event()
+        self._heartbeat_thread: Thread | None = None
 
     async def startup(self) -> None:
         """Create the Redis consumer group before receiving tasks."""
@@ -182,10 +187,7 @@ class RedisStreamsBroker(AsyncBroker):
             await super().shutdown()
         finally:
             await self._stop_heartbeat()
-            try:
-                await self.connection_pool.disconnect()
-            finally:
-                await self.heartbeat_connection_pool.disconnect()
+            await self.connection_pool.disconnect()
 
     async def kick(self, message: BrokerMessage) -> None:
         """Append a Taskiq message to this broker's Redis Stream."""
@@ -215,23 +217,20 @@ class RedisStreamsBroker(AsyncBroker):
         """Normalize Redis's bytes identifiers to strings."""
         return value.decode() if isinstance(value, bytes) else str(value)
 
-    async def _refresh_heartbeat(self) -> None:
+    def _refresh_heartbeat(self) -> None:
         """Renew this consumer's Redis TTL-backed liveness lease."""
-        async with Redis(connection_pool=self.heartbeat_connection_pool) as redis:
-            await redis.set(
-                self.consumer_heartbeat_key,
-                b"1",
-                px=self.consumer_heartbeat_ttl,
-            )
+        self._heartbeat_redis.set(
+            self.consumer_heartbeat_key,
+            b"1",
+            px=self.consumer_heartbeat_ttl,
+        )
 
-    async def _heartbeat_loop(self) -> None:
+    def _heartbeat_loop(self) -> None:
         """Keep the consumer lease alive until broker shutdown."""
-        while True:
-            await asyncio.sleep(self.consumer_heartbeat_interval / 1_000)
+        interval = self.consumer_heartbeat_interval / 1_000
+        while not self._heartbeat_stop.wait(interval):
             try:
-                await self._refresh_heartbeat()
-            except asyncio.CancelledError:
-                raise
+                self._refresh_heartbeat()
             except RedisError:
                 logger.warning(
                     "Unable to renew Redis consumer heartbeat; "
@@ -240,25 +239,47 @@ class RedisStreamsBroker(AsyncBroker):
                 )
 
     async def _start_heartbeat(self) -> None:
-        """Create the heartbeat task after its first lease is written."""
-        if self._heartbeat_task is not None:
+        """Start the heartbeat thread after its first lease is written."""
+        if self._heartbeat_thread is not None:
             return
-        await self._refresh_heartbeat()
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        await asyncio.to_thread(self._refresh_heartbeat)
+        self._heartbeat_stop.clear()
+        self._heartbeat_thread = Thread(
+            target=self._heartbeat_loop,
+            name=f"taskiq-redis-heartbeat-{self.consumer_name}",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _cleanup_heartbeat_connection(self) -> None:
+        """Remove the lease and release the synchronous heartbeat resources."""
+        try:
+            self._heartbeat_redis.delete(self.consumer_heartbeat_key)
+        except RedisError:
+            logger.warning("Unable to remove Redis consumer heartbeat", exc_info=True)
+        finally:
+            try:
+                self._heartbeat_redis.close()
+            finally:
+                self.heartbeat_connection_pool.disconnect()
 
     async def _stop_heartbeat(self) -> None:
         """Stop renewing and remove this consumer's liveness lease."""
-        heartbeat_task = self._heartbeat_task
-        self._heartbeat_task = None
-        if heartbeat_task is not None:
-            heartbeat_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await heartbeat_task
-        try:
-            async with Redis(connection_pool=self.heartbeat_connection_pool) as redis:
-                await redis.delete(self.consumer_heartbeat_key)
-        except RedisError:
-            logger.warning("Unable to remove Redis consumer heartbeat", exc_info=True)
+        heartbeat_thread = self._heartbeat_thread
+        self._heartbeat_thread = None
+        self._heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            await asyncio.to_thread(
+                heartbeat_thread.join,
+                HEARTBEAT_THREAD_JOIN_TIMEOUT,
+            )
+            if heartbeat_thread.is_alive():
+                logger.warning(
+                    "Heartbeat thread did not stop before shutdown; "
+                    "relying on Redis TTL for lease cleanup",
+                )
+                return
+        await asyncio.to_thread(self._cleanup_heartbeat_connection)
 
     async def _claim_orphaned_entries(
         self,
