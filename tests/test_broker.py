@@ -11,7 +11,7 @@ import pytest
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from taskiq import AckableMessage
-from taskiq.message import BrokerMessage, TaskiqMessage
+from taskiq.message import BrokerMessage
 from taskiq.utils import maybe_awaitable
 
 from taskiq_redis_streams import RedisStreamsBroker
@@ -31,25 +31,12 @@ def make_broker(redis_url: str, **kwargs: Any) -> RedisStreamsBroker:
 
 
 def raw_message(data: bytes = b"payload") -> BrokerMessage:
-    """Create an opaque broker payload without a Taskiq timeout label."""
+    """Create an opaque broker payload."""
     return BrokerMessage(
         task_id=uuid.uuid4().hex,
         task_name="test.task",
         message=data,
         labels={},
-    )
-
-
-def timeout_message(broker: RedisStreamsBroker, timeout: float) -> BrokerMessage:
-    """Create a serialized Taskiq message with the task timeout label."""
-    return broker.formatter.dumps(
-        TaskiqMessage(
-            task_id=uuid.uuid4().hex,
-            task_name="test.task",
-            labels={"timeout": timeout},
-            args=[],
-            kwargs={},
-        ),
     )
 
 
@@ -111,44 +98,14 @@ async def test_namespaced_stream_round_trip_and_ack(redis_url: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_task_timeout_controls_reclaim_deadline(redis_url: str) -> None:
-    """A task-specific timeout overrides the broker fallback reclaim deadline."""
+async def test_reclaims_entry_whose_consumer_heartbeat_has_expired(
+    redis_url: str,
+) -> None:
+    """An entry held by a consumer without a lease is recovered."""
     broker = make_broker(
         redis_url,
-        reclaim_timeout=10_000,
-        reclaim_timeout_grace=0,
-        reclaim_interval=0,
-    )
-    await broker.startup()
-    message = timeout_message(broker, timeout=0.02)
-    await broker.kick(message)
-
-    redis = Redis.from_url(redis_url)
-    try:
-        await redis.xreadgroup(
-            broker.consumer_group_name,
-            "crashed-worker",
-            {broker.stream_name: ">"},
-            count=1,
-        )
-        await asyncio.sleep(0.05)
-
-        listener = broker.listen()
-        received = await next_message(listener)
-        assert received.data == message.message
-        await acknowledge(received)
-        await listener.aclose()
-    finally:
-        await redis.aclose()
-        await broker.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_fallback_reclaim_deadline_for_non_taskiq_payload(redis_url: str) -> None:
-    """Opaque payloads use the configured fallback reclaim deadline."""
-    broker = make_broker(
-        redis_url,
-        reclaim_timeout=20,
+        consumer_heartbeat_interval=10,
+        consumer_heartbeat_ttl=20,
         reclaim_interval=0,
     )
     await broker.startup()
@@ -162,7 +119,7 @@ async def test_fallback_reclaim_deadline_for_non_taskiq_payload(redis_url: str) 
             {broker.stream_name: ">"},
             count=1,
         )
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.02)
 
         listener = broker.listen()
         received = await next_message(listener)
@@ -175,44 +132,105 @@ async def test_fallback_reclaim_deadline_for_non_taskiq_payload(redis_url: str) 
 
 
 @pytest.mark.asyncio
-async def test_reclaim_can_be_disabled(redis_url: str) -> None:
-    """Disabled reclaim leaves a crashed consumer's pending entry untouched."""
-    broker = make_broker(
+async def test_live_consumer_heartbeat_prevents_reclaim(redis_url: str) -> None:
+    """A healthy worker retains a long-running entry regardless of its idle age."""
+    first = make_broker(
         redis_url,
-        reclaim_enabled=False,
-        reclaim_timeout=1,
+        consumer_heartbeat_interval=10,
+        consumer_heartbeat_ttl=30,
         reclaim_interval=0,
     )
-    await broker.startup()
-    await broker.kick(raw_message())
+    await first.startup()
+    await first.kick(raw_message())
+    first_listener = first.listen()
+    received = await next_message(first_listener)
 
+    replacement = RedisStreamsBroker(
+        redis_url,
+        queue_name=first.queue_name,
+        namespace=first.namespace,
+        xread_block=20,
+        consumer_heartbeat_interval=10,
+        consumer_heartbeat_ttl=30,
+        reclaim_interval=0,
+    )
+    await replacement.startup()
+    replacement_listener = replacement.listen()
     redis = Redis.from_url(redis_url)
-    listener = broker.listen()
     try:
-        await redis.xreadgroup(
-            broker.consumer_group_name,
-            "crashed-worker",
-            {broker.stream_name: ">"},
-            count=1,
-        )
         await asyncio.sleep(0.05)
-
         with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(anext(listener), timeout=0.1)
+            await asyncio.wait_for(anext(replacement_listener), timeout=0.1)
 
         pending = await redis.xpending_range(
-            broker.stream_name,
-            broker.consumer_group_name,
+            first.stream_name,
+            first.consumer_group_name,
             min="-",
             max="+",
             count=10,
         )
-        assert len(pending) == 1
-        assert as_text(pending[0]["consumer"]) == "crashed-worker"
+        assert as_text(pending[0]["consumer"]) == first.consumer_name
+        assert await redis.exists(first.consumer_heartbeat_key)
+        await acknowledge(received)
     finally:
-        await listener.aclose()
         await redis.aclose()
+        await replacement_listener.aclose()
+        await replacement.shutdown()
+        await first_listener.aclose()
+        await first.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_expires_after_configured_lease_ttl(
+    redis_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed heartbeat refresh eventually lets the Redis lease expire."""
+    broker = make_broker(
+        redis_url,
+        consumer_heartbeat_interval=10,
+        consumer_heartbeat_ttl=30,
+    )
+    await broker.startup()
+    await broker.kick(raw_message())
+    listener = broker.listen()
+    received = await next_message(listener)
+    redis = Redis.from_url(redis_url)
+
+    async def unavailable_heartbeat() -> None:
+        raise RedisError("temporary connection failure")
+
+    monkeypatch.setattr(broker, "_refresh_heartbeat", unavailable_heartbeat)
+    try:
+        assert broker.consumer_heartbeat_ttl == 30
+        await asyncio.sleep(0.1)
+        assert not await redis.exists(broker.consumer_heartbeat_key)
+        await acknowledge(received)
+    finally:
+        await redis.aclose()
+        await listener.aclose()
         await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_listener_close_keeps_heartbeat_until_broker_shutdown(
+    redis_url: str,
+) -> None:
+    """Taskiq can drain running tasks after listener cancellation."""
+    broker = make_broker(redis_url)
+    await broker.startup()
+    await broker.kick(raw_message())
+    listener = broker.listen()
+    received = await next_message(listener)
+    redis = Redis.from_url(redis_url)
+    try:
+        await listener.aclose()
+        assert await redis.exists(broker.consumer_heartbeat_key)
+        await acknowledge(received)
+    finally:
+        await broker.shutdown()
+        assert not await redis.exists(broker.consumer_heartbeat_key)
+        await redis.aclose()
 
 
 @pytest.mark.asyncio
@@ -256,7 +274,7 @@ async def test_listen_retries_a_failed_reclaim_scan_immediately(
     broker = make_broker(redis_url)
     await broker.startup()
     await broker.kick(raw_message())
-    original_claim = broker._claim_overdue_entries
+    original_claim = broker._claim_orphaned_entries
     attempts = 0
 
     async def flaky_claim(
@@ -272,7 +290,7 @@ async def test_listen_retries_a_failed_reclaim_scan_immediately(
         return await original_claim(redis, limit, protected, pending_start)
 
     monkeypatch.setattr(broker_module, "RETRY_INITIAL_DELAY", 0)
-    monkeypatch.setattr(broker, "_claim_overdue_entries", flaky_claim)
+    monkeypatch.setattr(broker, "_claim_orphaned_entries", flaky_claim)
     listener = broker.listen()
     try:
         received = await next_message(listener)
@@ -353,7 +371,6 @@ async def test_close_hands_unyielded_buffer_to_abandoned_consumer(
         redis_url,
         xread_count=2,
         max_pending=2,
-        reclaim_timeout=60_000,
         reclaim_interval=0,
     )
     await broker.startup()
@@ -380,7 +397,6 @@ async def test_close_hands_unyielded_buffer_to_abandoned_consumer(
             queue_name=broker.queue_name,
             namespace=broker.namespace,
             xread_block=20,
-            reclaim_timeout=60_000,
             reclaim_interval=0,
         )
         await replacement.startup()

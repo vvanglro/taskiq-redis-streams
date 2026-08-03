@@ -1,4 +1,4 @@
-"""Redis Streams broker with bounded local prefetch and timeout-aware recovery."""
+"""Redis Streams broker with bounded local prefetch and heartbeat recovery."""
 
 from __future__ import annotations
 
@@ -16,7 +16,11 @@ from taskiq import AckableMessage
 from taskiq.abc.broker import AsyncBroker
 from taskiq.message import BrokerMessage
 
-from taskiq_redis_streams.keys import consumer_group_key, stream_key
+from taskiq_redis_streams.keys import (
+    consumer_group_key,
+    consumer_heartbeat_key,
+    stream_key,
+)
 
 logger = getLogger(__name__)
 
@@ -25,12 +29,25 @@ ABANDONED_IDLE_MS = 10**12
 RETRY_INITIAL_DELAY = 0.1
 RETRY_MAX_DELAY = 5.0
 
+_CLAIM_IF_HEARTBEAT_MISSING = """
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    return false
+end
+local claimed = redis.call(
+    'XCLAIM', KEYS[2], ARGV[1], ARGV[2], ARGV[3], ARGV[4], 'JUSTID'
+)
+if #claimed == 0 then
+    return false
+end
+return claimed[1]
+"""
+
 StreamEntry: TypeAlias = tuple[str, dict[bytes, bytes]]
 ConnectionPool: TypeAlias = BlockingConnectionPool
 
 
 class RedisStreamsBroker(AsyncBroker):
-    """A single-queue Taskiq broker backed by one Redis Stream.
+    """A single-queue Taskiq broker with heartbeat-based Redis Stream recovery.
 
     Redis Streams provide at-least-once delivery. Task handlers must therefore
     be idempotent: an unacknowledged entry may be reclaimed by another worker.
@@ -47,11 +64,10 @@ class RedisStreamsBroker(AsyncBroker):
         max_pending: int | None = 100,
         maxlen: int | None = None,
         approximate: bool = True,
-        reclaim_enabled: bool = True,
-        reclaim_timeout: int = 600_000,
-        reclaim_timeout_grace: int = 10_000,
         reclaim_interval: int = 30_000,
         reclaim_batch_size: int = 100,
+        consumer_heartbeat_interval: int = 10_000,
+        consumer_heartbeat_ttl: int = 30_000,
         max_connection_pool_size: int | None = None,
         **connection_kwargs: Any,
     ) -> None:
@@ -66,15 +82,13 @@ class RedisStreamsBroker(AsyncBroker):
             successfully acknowledged. ``None`` disables the local cap.
         :param maxlen: Optional Redis Stream length limit.
         :param approximate: Use Redis's approximate stream trimming when set.
-        :param reclaim_enabled: Enable automatic recovery of pending entries.
-            Set to ``False`` when recovery is managed outside this broker.
-        :param reclaim_timeout: Fallback reclaim deadline in milliseconds for
-            payloads without a valid Taskiq ``timeout`` label.
-        :param reclaim_timeout_grace: Extra milliseconds added to a task's
-            timeout label before an unacknowledged entry is reclaimed.
         :param reclaim_interval: Milliseconds between PEL recovery scans. Set
             to ``0`` to scan before every read.
         :param reclaim_batch_size: Maximum PEL entries examined in one scan.
+        :param consumer_heartbeat_interval: Milliseconds between liveness
+            lease renewals for this Redis consumer.
+        :param consumer_heartbeat_ttl: Milliseconds an unrefreshed consumer
+            heartbeat remains live before its pending entries are reclaimable.
         :param max_connection_pool_size: Maximum Redis connections in the pool.
         :param connection_kwargs: Extra arguments accepted by redis-py.
         """
@@ -88,12 +102,17 @@ class RedisStreamsBroker(AsyncBroker):
             raise ValueError("xread_count must be greater than zero")
         if max_pending is not None and max_pending <= 0:
             raise ValueError("max_pending must be greater than zero or None")
-        if reclaim_timeout < 0 or reclaim_timeout_grace < 0:
-            raise ValueError("reclaim timeouts must be non-negative")
         if reclaim_interval < 0:
             raise ValueError("reclaim_interval must be non-negative")
         if reclaim_batch_size <= 0:
             raise ValueError("reclaim_batch_size must be greater than zero")
+        if consumer_heartbeat_interval <= 0:
+            raise ValueError("consumer_heartbeat_interval must be greater than zero")
+        if consumer_heartbeat_ttl <= consumer_heartbeat_interval:
+            raise ValueError(
+                "consumer_heartbeat_ttl must be greater than "
+                "consumer_heartbeat_interval",
+            )
 
         # Stream payloads must remain bytes because Taskiq formatters operate on
         # bytes. Do not let a caller accidentally enable decode_responses.
@@ -111,16 +130,21 @@ class RedisStreamsBroker(AsyncBroker):
             namespace,
         )
         self.consumer_name = f"worker-{uuid.uuid4().hex}"
+        self.consumer_heartbeat_key = consumer_heartbeat_key(
+            queue_name,
+            namespace,
+            self.consumer_name,
+        )
         self.xread_block = xread_block
         self.xread_count = xread_count
         self.max_pending = max_pending
         self.maxlen = maxlen
         self.approximate = approximate
-        self.reclaim_enabled = reclaim_enabled
-        self.reclaim_timeout = reclaim_timeout
-        self.reclaim_timeout_grace = reclaim_timeout_grace
         self.reclaim_interval = reclaim_interval
         self.reclaim_batch_size = reclaim_batch_size
+        self.consumer_heartbeat_interval = consumer_heartbeat_interval
+        self.consumer_heartbeat_ttl = consumer_heartbeat_ttl
+        self._heartbeat_task: asyncio.Task[None] | None = None
 
     async def startup(self) -> None:
         """Create the Redis consumer group before receiving tasks."""
@@ -136,11 +160,16 @@ class RedisStreamsBroker(AsyncBroker):
             except ResponseError as exc:
                 if "BUSYGROUP" not in str(exc):
                     raise
+        if self.is_worker_process:
+            await self._start_heartbeat()
 
     async def shutdown(self) -> None:
         """Close Taskiq resources and the Redis connection pool."""
-        await super().shutdown()
-        await self.connection_pool.disconnect()
+        try:
+            await super().shutdown()
+        finally:
+            await self._stop_heartbeat()
+            await self.connection_pool.disconnect()
 
     async def kick(self, message: BrokerMessage) -> None:
         """Append a Taskiq message to this broker's Redis Stream."""
@@ -170,46 +199,59 @@ class RedisStreamsBroker(AsyncBroker):
         """Normalize Redis's bytes identifiers to strings."""
         return value.decode() if isinstance(value, bytes) else str(value)
 
-    def _reclaim_deadline(self, entry: dict[bytes, bytes]) -> int:
-        """Resolve an entry's reclaim deadline from its serialized task label."""
-        payload = entry.get(b"data")
-        if payload is None:
-            return self.reclaim_timeout
+    async def _refresh_heartbeat(self) -> None:
+        """Renew this consumer's Redis TTL-backed liveness lease."""
+        async with Redis(connection_pool=self.connection_pool) as redis:
+            await redis.set(
+                self.consumer_heartbeat_key,
+                b"1",
+                px=self.consumer_heartbeat_ttl,
+            )
 
-        with suppress(Exception):
-            timeout = self.formatter.loads(payload).labels.get("timeout")
-            if timeout is not None:
-                return int(float(timeout) * 1_000) + self.reclaim_timeout_grace
-        return self.reclaim_timeout
+    async def _heartbeat_loop(self) -> None:
+        """Keep the consumer lease alive until broker shutdown."""
+        while True:
+            await asyncio.sleep(self.consumer_heartbeat_interval / 1_000)
+            try:
+                await self._refresh_heartbeat()
+            except asyncio.CancelledError:
+                raise
+            except RedisError:
+                logger.warning(
+                    "Unable to renew Redis consumer heartbeat; "
+                    "the lease may expire before the next renewal succeeds",
+                    exc_info=True,
+                )
 
-    async def _entry_for_pending_id(
-        self,
-        redis: Redis,
-        message_id: str,
-    ) -> dict[bytes, bytes] | None:
-        """Load one PEL entry from the Stream so its task timeout can be read."""
-        entries = await redis.xrange(
-            self.stream_name,
-            min=message_id,
-            max=message_id,
-            count=1,
-        )
-        if not entries:
-            return None
-        return cast("dict[bytes, bytes]", entries[0][1])
+    async def _start_heartbeat(self) -> None:
+        """Create the heartbeat task after its first lease is written."""
+        if self._heartbeat_task is not None:
+            return
+        await self._refresh_heartbeat()
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
-    async def _claim_overdue_entries(
+    async def _stop_heartbeat(self) -> None:
+        """Stop renewing and remove this consumer's liveness lease."""
+        heartbeat_task = self._heartbeat_task
+        self._heartbeat_task = None
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+        try:
+            async with Redis(connection_pool=self.connection_pool) as redis:
+                await redis.delete(self.consumer_heartbeat_key)
+        except RedisError:
+            logger.warning("Unable to remove Redis consumer heartbeat", exc_info=True)
+
+    async def _claim_orphaned_entries(
         self,
         redis: Redis,
         limit: int,
         protected: set[str],
         pending_start: str,
     ) -> tuple[list[StreamEntry], str]:
-        """Claim overdue PEL entries, with Redis enforcing the final deadline.
-
-        ``XCLAIM min_idle_time`` is the atomic guard: concurrent workers may
-        inspect the same PEL entry, but only one can successfully claim it.
-        """
+        """Claim PEL entries whose consumer heartbeat lease has expired."""
         pending = await redis.xpending_range(
             self.stream_name,
             self.consumer_group_name,
@@ -218,56 +260,101 @@ class RedisStreamsBroker(AsyncBroker):
             count=self.reclaim_batch_size,
             idle=0,
         )
-        claimed: list[StreamEntry] = []
-        last_checked_id: str | None = None
-
+        pending_entries: list[tuple[str, str]] = []
+        owners: list[str] = []
+        seen_owners: set[str] = set()
         for pending_entry in pending:
-            if len(claimed) >= limit:
+            message_id = self._to_str(pending_entry["message_id"])
+            owner = self._to_str(pending_entry["consumer"])
+            pending_entries.append((message_id, owner))
+            if message_id in protected or owner == self.consumer_name:
+                continue
+            if owner not in seen_owners:
+                seen_owners.add(owner)
+                owners.append(owner)
+
+        live_owners: set[str] = set()
+        if owners:
+            heartbeat_pipeline = redis.pipeline(transaction=False)
+            for owner in owners:
+                heartbeat_pipeline.exists(
+                    consumer_heartbeat_key(
+                        self.queue_name,
+                        self.namespace,
+                        owner,
+                    ),
+                )
+            heartbeat_results = await heartbeat_pipeline.execute()
+            live_owners = {
+                owner
+                for owner, heartbeat_exists in zip(
+                    owners,
+                    heartbeat_results,
+                    strict=True,
+                )
+                if heartbeat_exists
+            }
+
+        claim_candidates: list[tuple[str, str]] = []
+        last_checked_id: str | None = None
+        for message_id, owner in pending_entries:
+            last_checked_id = message_id
+            if (
+                message_id in protected
+                or owner == self.consumer_name
+                or owner in live_owners
+            ):
+                continue
+            claim_candidates.append((message_id, owner))
+            if len(claim_candidates) >= limit:
                 break
 
-            message_id = self._to_str(pending_entry["message_id"])
-            last_checked_id = message_id
-            if message_id in protected:
-                continue
-
-            entry = await self._entry_for_pending_id(redis, message_id)
-            if entry is None:
-                # Redis removes a PEL reference when XCLAIM finds that the
-                # matching Stream entry has already been trimmed or deleted.
-                await redis.xclaim(
+        claimed_ids: list[str] = []
+        if claim_candidates:
+            claim_pipeline = redis.pipeline(transaction=False)
+            for message_id, owner in claim_candidates:
+                claim_pipeline.eval(
+                    _CLAIM_IF_HEARTBEAT_MISSING,
+                    2,
+                    consumer_heartbeat_key(
+                        self.queue_name,
+                        self.namespace,
+                        owner,
+                    ),
                     self.stream_name,
                     self.consumer_group_name,
                     self.consumer_name,
-                    min_idle_time=0,
-                    message_ids=[message_id],
-                    justid=True,
+                    self.consumer_heartbeat_ttl,
+                    message_id,
                 )
-                continue
+            claim_results = await claim_pipeline.execute()
+            claimed_ids = [
+                self._to_str(cast("bytes | str | int", result))
+                for result in claim_results
+                if result
+            ]
 
-            deadline = self._reclaim_deadline(entry)
-            idle_time = int(cast(Any, pending_entry["time_since_delivered"]))
-            if idle_time < deadline:
-                continue
-
-            result = await redis.xclaim(
-                self.stream_name,
-                self.consumer_group_name,
-                self.consumer_name,
-                min_idle_time=deadline,
-                message_ids=[message_id],
-            )
-            for claimed_id, claimed_entry in cast("list[Any]", result):
-                claimed.append(
-                    (
-                        self._to_str(cast("bytes | str", claimed_id)),
-                        cast("dict[bytes, bytes]", claimed_entry),
-                    ),
+        claimed: list[StreamEntry] = []
+        if claimed_ids:
+            entries_pipeline = redis.pipeline(transaction=False)
+            for message_id in claimed_ids:
+                entries_pipeline.xrange(
+                    self.stream_name,
+                    min=message_id,
+                    max=message_id,
+                    count=1,
                 )
+            entries = await entries_pipeline.execute()
+            for message_id, entry in zip(claimed_ids, entries, strict=True):
+                if entry:
+                    claimed.append(
+                        (message_id, cast("dict[bytes, bytes]", entry[0][1])),
+                    )
 
         next_start = "-"
         if len(pending) == self.reclaim_batch_size and last_checked_id is not None:
             # XPENDING RANGE's parenthesized lower bound is exclusive. Without
-            # it, a protected head entry can starve later abandoned entries.
+            # it, a live consumer at the head can starve later orphaned entries.
             next_start = f"({last_checked_id}"
         return claimed, next_start
 
@@ -348,7 +435,8 @@ class RedisStreamsBroker(AsyncBroker):
             )
         except RedisError:
             # Listener cancellation must not turn a best-effort handoff into a
-            # shutdown failure. The normal reclaim timeout remains the fallback.
+            # shutdown failure. The next heartbeat-based reclaim scan remains
+            # the fallback.
             logger.warning(
                 "Unable to abandon buffered Redis Stream entries",
                 exc_info=True,
@@ -368,6 +456,8 @@ class RedisStreamsBroker(AsyncBroker):
         last_reclaim = 0.0
         pending_start = "-"
 
+        await self._start_heartbeat()
+
         def on_ack(message_id: str) -> None:
             nonlocal pending
             delivered.discard(message_id)
@@ -385,14 +475,15 @@ class RedisStreamsBroker(AsyncBroker):
                             slot_freed.clear()
                             continue
 
-                        if self.reclaim_enabled and self._reclaim_is_due(last_reclaim):
+                        if self._reclaim_is_due(last_reclaim):
                             reclaim_limit = available or self.reclaim_batch_size
-                            buffered, pending_start = await self._claim_overdue_entries(
+                            reclaim_result = await self._claim_orphaned_entries(
                                 redis,
                                 reclaim_limit,
                                 delivered,
                                 pending_start,
                             )
+                            buffered, pending_start = reclaim_result
                             last_reclaim = time.monotonic()
 
                         if not buffered:
@@ -429,5 +520,4 @@ class RedisStreamsBroker(AsyncBroker):
                         await asyncio.sleep(retry_delay)
                         retry_delay = min(retry_delay * 2, RETRY_MAX_DELAY)
             finally:
-                if self.reclaim_enabled:
-                    await self._abandon_buffered_entries(redis, buffered)
+                await self._abandon_buffered_entries(redis, buffered)

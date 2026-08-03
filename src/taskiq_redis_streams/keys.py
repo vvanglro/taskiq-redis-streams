@@ -11,3 +11,12 @@ def stream_key(queue_name: str, namespace: str) -> str:
 def consumer_group_key(queue_name: str, namespace: str) -> str:
     """Return the default consumer group key for a Taskiq queue."""
     return f"{namespace}:workers:{queue_name}"
+
+
+def consumer_heartbeat_key(
+    queue_name: str,
+    namespace: str,
+    consumer_name: str,
+) -> str:
+    """Return the TTL-backed liveness key for one Redis consumer."""
+    return f"{namespace}:heartbeat:{queue_name}:{consumer_name}"

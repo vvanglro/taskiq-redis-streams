@@ -3,7 +3,7 @@
 [English](README.md)
 
 一个独立维护的单节点 Redis Streams [Taskiq](https://taskiq-python.github.io/)
-broker，提供受限的本地预取和基于任务时限的 PEL 恢复机制。
+broker，提供受限的本地预取和基于 consumer heartbeat 的 PEL 恢复机制。
 
 Redis Streams 提供的是至少一次投递语义。worker 崩溃或确认失败后，任务可能
 会执行多次，因此任务处理函数必须是幂等的。
@@ -46,38 +46,35 @@ consumer group 固定从 stream offset `0` 开始，因此第一个 worker 启�
 ```text
 <namespace>:stream:<queue_name>
 <namespace>:workers:<queue_name>
+<namespace>:heartbeat:<queue_name>:<consumer_name>
 ```
 
 多个应用共用同一个 Redis 时应使用不同的 `namespace`。默认值为 `taskiq`。
 
 每个 broker 实例都会生成独立的 Redis consumer 名称，且不支持配置。worker
-重启后会使用新的身份，前一个实例遗留的 pending entry 将继续走正常的恢复流程。
+重启后会使用新的身份。活跃 worker consumer 会续写 Redis TTL heartbeat；owner
+heartbeat 已过期的 pending entry 会进入恢复流程。
 
 `xread_count` 控制一次 `XREADGROUP` 拉取的消息数量。`max_pending` 独立限制
 一个 listener 已拉取但尚未成功确认的 entry 数量，二者默认都是 `100`。达到
 上限后，listener 不会继续占用新的 stream entry，从而让同一 group 中的其他
 consumer 有机会获取任务。设置 `max_pending=None` 可关闭这一项本地限制。
 
-broker 会定期扫描 consumer group 的 pending entries list (PEL)。对于包含
-`timeout` label 的序列化 Taskiq 消息，entry 在以下时间后可以被 reclaim：
+broker 会定期扫描 consumer group 的 pending entries list (PEL)。每个活跃
+consumer 会按 `consumer_heartbeat_interval`（默认 `10000` 毫秒）续写 heartbeat。
+每次成功续写后，heartbeat 在 `consumer_heartbeat_ttl`（默认 `30000` 毫秒）内
+保持有效；租约过期后，下一次 PEL scan 会恢复该 consumer 的 entry。`XCLAIM`
+前会在 Redis 内原子检查 heartbeat，因此并发 worker 不会同时恢复同一条 entry。
+TTL 应大于续写间隔，以容纳正常的调度延迟和 Redis 网络延迟。reclaim scan 到期时，
+已恢复的 entry 会优先于新消息处理。
 
-```text
-timeout * 1000 + reclaim_timeout_grace
-```
-
-无法读取 timeout 的消息使用 `reclaim_timeout`。`XCLAIM` 会在 Redis 内原子地
-完成最终的 deadline 校验，因此不需要额外的分布式 reclaim 锁。reclaim scan
-到期时，已恢复的 entry 会优先于新消息处理。
-
-设置 `reclaim_enabled=False` 可以关闭所有自动 PEL 恢复。在该模式下，broker
-既不扫描 pending entry，也不会在 listener 关闭时将缓冲 entry 交接给内部的
-`abandoned` consumer。这适用于应用需要自行管理长时间任务恢复策略的场景。
-此时未确认的任务必须由用户通过 Redis 命令，或启动一个开启 reclaim 的 broker
-来显式恢复。
+Taskiq 的 `timeout` label 仍控制任务执行时限，但不再控制 Redis Streams 恢复。
+因此活跃 worker 可以执行长任务，而不会仅因任务持续时间过长就被 reclaim。
 
 listener 关闭时，只有仍在 broker 本地 buffer 内、尚未 yield 给 Taskiq 的消息
 会被交接给内部 `abandoned` consumer，并立即具备被下次 recovery scan 恢复的
-资格。已经 yield 的消息可能正在执行，因此仍遵循正常的确认或 reclaim 生命周期。
+资格。已经 yield 的消息可能正在执行；其 worker heartbeat 会持续到 broker
+shutdown，从而允许 Taskiq drain 这些任务而不会发生重复 reclaim。
 
 listener 遇到可重试的 Redis 错误时，会从 100 ms 到 5 秒进行指数退避重试。
 Taskiq 的取消不会进入重试，而是向上传播，以便正常执行 listener 关闭时的消息交接。
