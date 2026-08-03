@@ -60,6 +60,9 @@ heartbeat 已过期的 pending entry 会进入恢复流程。
 上限后，listener 不会继续占用新的 stream entry，从而让同一 group 中的其他
 consumer 有机会获取任务。设置 `max_pending=None` 可关闭这一项本地限制。
 
+`max_connection_pool_size` 只限制任务投递相关命令使用的连接。broker 会额外保留
+一个 Redis 连接用于 heartbeat 续写，因此阻塞读取不会阻塞 consumer lease 的续写。
+
 broker 会定期扫描 consumer group 的 pending entries list (PEL)。每个活跃
 consumer 会按 `consumer_heartbeat_interval`（默认 `10000` 毫秒）续写 heartbeat。
 每次成功续写后，heartbeat 在 `consumer_heartbeat_ttl`（默认 `30000` 毫秒）内

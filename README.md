@@ -63,6 +63,10 @@ caps entries fetched by a listener but not successfully acknowledged; both
 default to `100`. Once the cap is reached, the listener leaves new work for
 other consumers. Set `max_pending=None` to disable that local cap.
 
+`max_connection_pool_size` applies to task delivery commands. The broker keeps
+one separate Redis connection for heartbeat renewal, so a blocking read cannot
+prevent the consumer lease from being refreshed.
+
 The broker scans the consumer group's PEL periodically. It renews each active
 consumer's heartbeat every `consumer_heartbeat_interval` milliseconds (default
 `10000`). A heartbeat remains live for `consumer_heartbeat_ttl` milliseconds

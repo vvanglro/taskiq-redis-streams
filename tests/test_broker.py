@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncGenerator
+from contextlib import suppress
 from typing import Any
 
 import pytest
@@ -21,11 +22,12 @@ from taskiq_redis_streams.broker import ABANDONED_CONSUMER
 
 def make_broker(redis_url: str, **kwargs: Any) -> RedisStreamsBroker:
     """Build a broker whose Redis keys cannot overlap another test's keys."""
+    xread_block = kwargs.pop("xread_block", 20)
     return RedisStreamsBroker(
         redis_url,
         queue_name="jobs",
         namespace=f"test-{uuid.uuid4().hex}",
-        xread_block=20,
+        xread_block=xread_block,
         **kwargs,
     )
 
@@ -210,6 +212,71 @@ async def test_heartbeat_expires_after_configured_lease_ttl(
         await redis.aclose()
         await listener.aclose()
         await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_uses_a_dedicated_connection_pool(redis_url: str) -> None:
+    """A blocking listener cannot prevent heartbeat lease renewal."""
+    broker = make_broker(
+        redis_url,
+        xread_block=0,
+        max_connection_pool_size=1,
+        consumer_heartbeat_interval=10,
+        consumer_heartbeat_ttl=60,
+    )
+    await broker.startup()
+    await broker.kick(raw_message())
+    listener = broker.listen()
+    received = await next_message(listener)
+    blocking_read = asyncio.create_task(anext(listener))
+    redis = Redis.from_url(redis_url)
+    try:
+        await asyncio.sleep(0.1)
+        assert await redis.exists(broker.consumer_heartbeat_key)
+    finally:
+        blocking_read.cancel()
+        with suppress(asyncio.CancelledError):
+            await blocking_read
+        await listener.aclose()
+        await acknowledge(received)
+        await redis.aclose()
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_clean_shutdown_allows_immediate_reclaim(redis_url: str) -> None:
+    """A removed heartbeat does not make a replacement wait for the lease TTL."""
+    first = make_broker(
+        redis_url,
+        consumer_heartbeat_interval=10,
+        consumer_heartbeat_ttl=10_000,
+        reclaim_interval=0,
+    )
+    await first.startup()
+    await first.kick(raw_message())
+    first_listener = first.listen()
+    await next_message(first_listener)
+    await first_listener.aclose()
+    await first.shutdown()
+
+    replacement = RedisStreamsBroker(
+        redis_url,
+        queue_name=first.queue_name,
+        namespace=first.namespace,
+        xread_block=20,
+        consumer_heartbeat_interval=10,
+        consumer_heartbeat_ttl=10_000,
+        reclaim_interval=0,
+    )
+    await replacement.startup()
+    replacement_listener = replacement.listen()
+    try:
+        recovered = await next_message(replacement_listener)
+        assert recovered.data == b"payload"
+        await acknowledge(recovered)
+    finally:
+        await replacement_listener.aclose()
+        await replacement.shutdown()
 
 
 @pytest.mark.asyncio

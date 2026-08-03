@@ -30,11 +30,15 @@ RETRY_INITIAL_DELAY = 0.1
 RETRY_MAX_DELAY = 5.0
 
 _CLAIM_IF_HEARTBEAT_MISSING = """
+local pending = redis.call('XPENDING', KEYS[2], ARGV[1], ARGV[4], ARGV[4], 1)
+if #pending == 0 or pending[1][2] ~= ARGV[2] then
+    return false
+end
 if redis.call('EXISTS', KEYS[1]) == 1 then
     return false
 end
 local claimed = redis.call(
-    'XCLAIM', KEYS[2], ARGV[1], ARGV[2], ARGV[3], ARGV[4], 'JUSTID'
+    'XCLAIM', KEYS[2], ARGV[1], ARGV[3], 0, ARGV[4]
 )
 if #claimed == 0 then
     return false
@@ -89,7 +93,9 @@ class RedisStreamsBroker(AsyncBroker):
             lease renewals for this Redis consumer.
         :param consumer_heartbeat_ttl: Milliseconds an unrefreshed consumer
             heartbeat remains live before its pending entries are reclaimable.
-        :param max_connection_pool_size: Maximum Redis connections in the pool.
+        :param max_connection_pool_size: Maximum Redis connections used for
+            task delivery commands. Heartbeat renewal uses one separate
+            connection so a blocking read cannot starve the liveness lease.
         :param connection_kwargs: Extra arguments accepted by redis-py.
         """
         super().__init__()
@@ -121,6 +127,13 @@ class RedisStreamsBroker(AsyncBroker):
             url,
             max_connections=max_connection_pool_size,
             **connection_kwargs,
+        )
+        self.heartbeat_connection_pool: ConnectionPool = (
+            BlockingConnectionPool.from_url(
+                url,
+                max_connections=1,
+                **connection_kwargs,
+            )
         )
         self.queue_name = queue_name
         self.namespace = namespace
@@ -169,7 +182,10 @@ class RedisStreamsBroker(AsyncBroker):
             await super().shutdown()
         finally:
             await self._stop_heartbeat()
-            await self.connection_pool.disconnect()
+            try:
+                await self.connection_pool.disconnect()
+            finally:
+                await self.heartbeat_connection_pool.disconnect()
 
     async def kick(self, message: BrokerMessage) -> None:
         """Append a Taskiq message to this broker's Redis Stream."""
@@ -201,7 +217,7 @@ class RedisStreamsBroker(AsyncBroker):
 
     async def _refresh_heartbeat(self) -> None:
         """Renew this consumer's Redis TTL-backed liveness lease."""
-        async with Redis(connection_pool=self.connection_pool) as redis:
+        async with Redis(connection_pool=self.heartbeat_connection_pool) as redis:
             await redis.set(
                 self.consumer_heartbeat_key,
                 b"1",
@@ -239,7 +255,7 @@ class RedisStreamsBroker(AsyncBroker):
             with suppress(asyncio.CancelledError):
                 await heartbeat_task
         try:
-            async with Redis(connection_pool=self.connection_pool) as redis:
+            async with Redis(connection_pool=self.heartbeat_connection_pool) as redis:
                 await redis.delete(self.consumer_heartbeat_key)
         except RedisError:
             logger.warning("Unable to remove Redis consumer heartbeat", exc_info=True)
@@ -309,7 +325,7 @@ class RedisStreamsBroker(AsyncBroker):
             if len(claim_candidates) >= limit:
                 break
 
-        claimed_ids: list[str] = []
+        claimed: list[StreamEntry] = []
         if claim_candidates:
             claim_pipeline = redis.pipeline(transaction=False)
             for message_id, owner in claim_candidates:
@@ -323,33 +339,22 @@ class RedisStreamsBroker(AsyncBroker):
                     ),
                     self.stream_name,
                     self.consumer_group_name,
+                    owner,
                     self.consumer_name,
-                    self.consumer_heartbeat_ttl,
                     message_id,
                 )
             claim_results = await claim_pipeline.execute()
-            claimed_ids = [
-                self._to_str(cast("bytes | str | int", result))
-                for result in claim_results
-                if result
-            ]
-
-        claimed: list[StreamEntry] = []
-        if claimed_ids:
-            entries_pipeline = redis.pipeline(transaction=False)
-            for message_id in claimed_ids:
-                entries_pipeline.xrange(
-                    self.stream_name,
-                    min=message_id,
-                    max=message_id,
-                    count=1,
+            for result in claim_results:
+                if not result:
+                    continue
+                claim_result = cast("list[Any]", result)
+                field_values = cast("list[bytes]", claim_result[1])
+                claimed.append(
+                    (
+                        self._to_str(cast("bytes | str", claim_result[0])),
+                        dict(zip(field_values[::2], field_values[1::2], strict=True)),
+                    ),
                 )
-            entries = await entries_pipeline.execute()
-            for message_id, entry in zip(claimed_ids, entries, strict=True):
-                if entry:
-                    claimed.append(
-                        (message_id, cast("dict[bytes, bytes]", entry[0][1])),
-                    )
 
         next_start = "-"
         if len(pending) == self.reclaim_batch_size and last_checked_id is not None:
